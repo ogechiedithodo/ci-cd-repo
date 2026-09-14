@@ -1,0 +1,202 @@
+name: CI Security Docker CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/oge-portfoliofor
+
+jobs:
+
+  # ==================================================
+  # 1. CONTINUOUS INTEGRATION
+  # ==================================================
+
+  ci:
+    name: CI - Build Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test --if-present
+
+      - name: Run lint
+        run: npm run lint --if-present
+
+      - name: Build application
+        run: npm run build
+
+
+  # ==================================================
+  # 2. TRIVY SOURCE CODE / DEPENDENCY SCAN
+  # ==================================================
+
+  security-scan:
+    name: Security - Trivy Scan
+    runs-on: ubuntu-latest
+
+    needs:
+      - ci
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+
+  # ==================================================
+  # 3. BUILD DOCKER IMAGE
+  # ==================================================
+
+  docker:
+    name: Docker - Build Scan and Push
+    runs-on: ubuntu-latest
+
+    needs:
+      - security-scan
+
+    # Do not push Docker images from pull requests
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      # ----------------------------------------------
+      # Scan the actual Docker image
+      # ----------------------------------------------
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # ----------------------------------------------
+      # Push only when security scan passes
+      # ----------------------------------------------
+
+      - name: Push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+
+  # ==================================================
+  # 4. CONTINUOUS DEPLOYMENT
+  # ==================================================
+
+  deploy:
+    name: CD - Deploy to Server
+    runs-on: ubuntu-latest
+
+    needs:
+      - docker
+
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deploy using SSH
+        uses: appleboy/ssh-action@v1.2.5
+
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT }}
+
+          script: |
+
+            echo "Logging into Docker Hub..."
+
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login \
+              -u "${{ secrets.DOCKERHUB_USERNAME }}" \
+              --password-stdin
+
+
+            echo "Pulling new Docker image..."
+
+            docker pull \
+              ${{ secrets.DOCKERHUB_USERNAME }}/oge-portfoliofor:${{ github.sha }}
+
+
+            echo "Stopping old container..."
+
+            docker stop oge-portfoliofor || true
+
+
+            echo "Removing old container..."
+
+            docker rm oge-portfoliofor || true
+
+
+            echo "Starting new container..."
+
+            docker run -d \
+              --name oge-portfoliofor \
+              --restart unless-stopped \
+              -p 80:80 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/oge-portfoliofor:${{ github.sha }}
+
+
+            echo "Removing unused Docker images..."
+
+            docker image prune -f
+
+
+            echo "Deployment successful."
