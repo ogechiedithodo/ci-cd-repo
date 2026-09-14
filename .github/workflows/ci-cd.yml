@@ -120,8 +120,8 @@ jobs:
           image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           format: table
           severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
+          ignore-unfixed: false
+          exit-code: "0"
 
       # ----------------------------------------------
       # Push only when security scan passes
